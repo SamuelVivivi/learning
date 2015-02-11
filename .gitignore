@@ -1,28 +1,329 @@
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
+// Camera.cpp: implementation of the CCamera class.
+//
+//////////////////////////////////////////////////////////////////////
 
-# Precompiled Headers
-*.gch
-*.pch
+#include "stdafx.h"
+#include "CConnectRobot.h"
+#include "Camera.h"
 
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
+#ifdef _DEBUG
+#undef THIS_FILE
+static char THIS_FILE[]=__FILE__;
+#define new DEBUG_NEW
+#endif
 
-# Fortran module files
-*.mod
+//////////////////////////////////////////////////////////////////////
+// Construction/Destruction
+//////////////////////////////////////////////////////////////////////
+#define CHECK( errc ) if ( GENAPI_E_OK != errc ) AfxMessageBox (errc)
+CCamera::CCamera()
+{
+  numDevices=0;
+  numGrabs=0;
+  payloadSize=0;
+  imgBuf=NULL;
+  isAvail=FALSE;
+  hDev=NULL;
+  width=2592;
+  height=1944;
+  nbit=8;
+  IsGrabbing=FALSE;
+}
 
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
+CCamera::~CCamera()
+{
+  ReleaseImageBuffer();
+  CloseCamera();
+}
+VOID   CCamera::SetGrabTotalFrames(int cnt)
+{
+	numGrabs=cnt;
+}
+int    CCamera::GetGrabTotalFrames()
+{
+	return numGrabs;
+}
+DWORD  CCamera::GetSizeOfFrame()
+{
+	return payloadSize;
+}
+int    CCamera::GetFrameWidth()
+{
+	return width;
+}
+int    CCamera::GetFrameHeight()
+{
+	return height;
+}
+int    CCamera::GetFrameBits()
+{
+	return nbit;
+}
+int    CCamera::GetBufferSize()
+{
+	 return payloadSize;
+}
+BOOL   CCamera::InitalCamera()
+{
+	bConnected=FALSE;
+  numGrabs=1;
+  PylonInitialize();
+  res = PylonEnumerateDevices( &numDevices );
+  CHECK(res);
+  if(numDevices<1)
+  {
+	  //
+	  PylonTerminate();
+	  return bConnected;
+  }
+  res = PylonCreateDeviceByIndex( 0, &hDev );
+  CHECK(res);
+  res = PylonDeviceOpen( hDev, PYLONC_ACCESS_MODE_CONTROL | PYLONC_ACCESS_MODE_STREAM );
+  if(res<0)
+  { 
+	  CloseCamera();
+	  	bConnected=FALSE;
+		numGrabs=1;
+		PylonInitialize();
+		res = PylonEnumerateDevices( &numDevices );
+		 CHECK(res);
+		 if(numDevices<1)
+		 {
+			 //
+				 PylonTerminate();
+				 return bConnected;
+		}
+		res = PylonCreateDeviceByIndex( 0, &hDev );
+		CHECK(res);
+		res = PylonDeviceOpen( hDev, PYLONC_ACCESS_MODE_CONTROL | PYLONC_ACCESS_MODE_STREAM );
+		if(res<0)
+			return bConnected;
+  }
+  CHECK(res);
+  try
+  {
+    /* Print out the name of the camera we are using. */
+    {
+        char buf[256];
+        size_t siz = sizeof(buf);
+        _Bool isReadable;
 
-# Executables
-*.exe
-*.out
-*.app
+        isReadable = PylonDeviceFeatureIsReadable(hDev, "DeviceModelName");
+        if ( isReadable )
+        {
+            res = PylonDeviceFeatureToString(hDev, "DeviceModelName", buf, &siz );
+            printf("Using camera %s\n", buf);
+			CHECK(res);
+        }
+    }
+
+    /* Set the pixel format to Mono8, where gray values will be output as 8 bit values for each pixel. */
+    /* ... Check first to see if the device supports the Mono8 format. */
+    isAvail = PylonDeviceFeatureIsAvailable(hDev, "EnumEntry_PixelFormat_Mono8");
+    if ( !isAvail )
+    {
+        /* Feature is not available. */
+        fprintf(stderr, "Device doesn't support the Mono8 pixel format.");
+        PylonTerminate();
+        exit (EXIT_FAILURE);
+    }
+    /* ... Set the pixel format to Mono8. */
+    res = PylonDeviceFeatureFromString(hDev, "PixelFormat", "Mono8" );
+    CHECK(res);
+    /* Disable acquisition start trigger if available */
+    isAvail = PylonDeviceFeatureIsAvailable( hDev, "EnumEntry_TriggerSelector_AcquisitionStart");
+    if (isAvail)
+    {
+        res = PylonDeviceFeatureFromString( hDev, "TriggerSelector", "AcquisitionStart");
+		CHECK(res);
+        res = PylonDeviceFeatureFromString( hDev, "TriggerMode", "Off");
+		CHECK(res);
+    }
+
+    /* Disable frame start trigger if available */
+    isAvail = PylonDeviceFeatureIsAvailable( hDev, "EnumEntry_TriggerSelector_FrameStart");
+    if (isAvail)
+    {
+        res = PylonDeviceFeatureFromString( hDev, "TriggerSelector", "FrameStart");
+		CHECK(res);
+        res = PylonDeviceFeatureFromString( hDev, "TriggerMode", "Off");
+		CHECK(res);
+
+    }
+
+    /* For GigE cameras, we recommend increasing the packet size for better 
+       performance. If the network adapter supports jumbo frames, set the packet 
+       size to a value > 1500, e.g., to 8192. In this sample, we only set the packet size
+       to 1500. */
+    /* ... Check first to see if the GigE camera packet size parameter is supported 
+        and if it is writable. */
+    isAvail = PylonDeviceFeatureIsWritable(hDev, "GevSCPSPacketSize");
+    if ( isAvail )
+    {
+        /* ... The device supports the packet size feature. Set a value. */
+        res = PylonDeviceSetIntegerFeature( hDev, "GevSCPSPacketSize", PACKSIZE );
+		CHECK(res);
+    }
+
+    /* Determine the required size of the grab buffer. */
+    res = PylonDeviceGetIntegerFeatureInt32( hDev, "PayloadSize", &payloadSize );
+    CHECK(res);
+    PylonDeviceInfo_t   di;
+   
+    res = PylonDeviceGetDeviceInfo( hDev, &di );
+    imgBuf = (unsigned char*) malloc( payloadSize*numGrabs );
+    if ( NULL == imgBuf )
+    {
+        fprintf( stderr, "Out of memory.\n" );
+        PylonTerminate();
+        AfxMessageBox("分配图像内存出错!");
+		bConnected=FALSE;
+
+    }
+    bConnected=TRUE;
+	return bConnected;
+  }
+  catch (CMemoryException* e)
+	{
+		char strerror[100];
+		e->GetErrorMessage(strerror,100,NULL);
+		CloseCamera();
+	//	AfxMessageBox(strerror);
+	}
+	catch (CFileException* e)
+	{
+		char strerror[100];
+		e->GetErrorMessage(strerror,100,NULL);
+		CloseCamera();
+	//	AfxMessageBox(strerror);
+	}
+	catch (CException* e)
+	{
+		char strerror[100];
+		e->GetErrorMessage(strerror,100,NULL);
+		CloseCamera();
+	//	AfxMessageBox(strerror);
+	}
+	return bConnected;
+}
+BOOL  CCamera::GetConnectStatus()
+{
+	return bConnected;
+}
+BOOL CCamera::ReleaseImageBuffer()
+{
+	if(!imgBuf)
+		return FALSE;
+	 free( imgBuf );
+	 return TRUE;
+}
+unsigned char* CCamera::GrabImages()
+{
+	 /* Allocate memory for grabbing. */
+    if(!imgBuf)return NULL;
+	try
+	{
+	
+	if(IsGrabbing)
+	{
+		AfxMessageBox("正在抓取图像当中。。。请稍候重试!");
+		return NULL;
+	}
+    IsGrabbing=TRUE;
+    /* Grab some images in a loop. */
+    for ( int i = 0; i < numGrabs; ++i )
+    {
+        //unsigned char min, max;
+        PylonGrabResult_t grabResult;
+        _Bool bufferReady;
+
+        /* Grab one single frame from stream channel 0. The 
+        camera is set to single frame acquisition mode.
+        Wait up to 500 ms for the image to be grabbed. */
+        res = PylonDeviceGrabSingleFrame( hDev, 0, imgBuf, payloadSize, 
+            &grabResult, &bufferReady, 500 );
+        if ( GENAPI_E_OK == res && !bufferReady )
+        {
+            /* Timeout occurred. */
+            printf("Frame %d: timeout\n", i+1);
+        }
+        CHECK(res);
+
+        /* Check to see if the image was grabbed successfully. */
+        //if ( grabResult.Status == Grabbed )
+        //{
+            /* Success. Perform image processing. */
+            //getMinMax( imgBuf, grabResult.SizeX, grabResult.SizeY, &min, &max );
+            //printf("Grabbed frame #%2d. Min. gray value = %3u, Max. gray value = %3u\n", i+1, min, max);
+
+            /* Display image */
+            //res = PylonImageWindowDisplayImageGrabResult(0, &grabResult);
+            //CHECK(res);
+        //}
+        if ( grabResult.Status == Failed )
+        {
+            fprintf( stderr,  "Frame %d wasn't grabbed successfully.  Error code = 0x%08X\n",
+                i+1, grabResult.ErrorCode );
+        }
+    }
+	IsGrabbing=FALSE;
+	return imgBuf;
+	}
+	catch (CMemoryException* e)
+	{
+		char strerror[100];
+		e->GetErrorMessage(strerror,100,NULL);
+		AfxMessageBox(strerror);
+	}
+	catch (CFileException* e)
+	{
+		char strerror[100];
+		e->GetErrorMessage(strerror,100,NULL);
+		AfxMessageBox(strerror);
+	}
+	catch (CException* e)
+	{
+		char strerror[100];
+		e->GetErrorMessage(strerror,100,NULL);
+		AfxMessageBox(strerror);
+		}
+	return imgBuf;
+}
+VOID   CCamera::CloseCamera()
+{
+   /* Clean up. Close and release the pylon device. */
+	try
+	{
+      if(!hDev)   return;
+      res = PylonDeviceClose( hDev );
+      CHECK(res);
+      
+      CHECK(res);
+      if(!imgBuf)   return;
+      /* Free memory for grabbing. */
+      free( imgBuf );
+      res = PylonDestroyDevice ( hDev );
+    /* Shut down the pylon runtime system. Don't call any pylon method after 
+       calling PylonTerminate(). */
+      PylonTerminate(); 
+    }
+	catch (CMemoryException* e)
+	{
+		char strerror[100];
+		e->GetErrorMessage(strerror,100,NULL);
+	//	AfxMessageBox(strerror);
+	}
+	catch (CFileException* e)
+	{
+		char strerror[100];
+		e->GetErrorMessage(strerror,100,NULL);
+	//	AfxMessageBox(strerror);
+	}
+	catch (CException* e)
+	{
+		char strerror[100];
+		e->GetErrorMessage(strerror,100,NULL);
+
+	//	AfxMessageBox(strerror);
+	}
+}
